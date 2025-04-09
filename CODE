@@ -1,0 +1,335 @@
+!pip install optuna xgboost imblearn scikeras scikit-optimize pymoo catboost
+
+!pip install --upgrade pandas==2.2.2 numpy==1.26.4
+
+import numpy as np
+import pandas as pd
+
+import optuna
+import random
+import torch
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+from sklearn.multioutput import MultiOutputRegressor
+import xgboost as xgb
+import matplotlib.pyplot as plt
+from tabulate import tabulate
+import joblib
+
+# Đặt seed cố định
+SEED = 60
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Load the data
+file_path = '/content/dataset_formodel33.xlsx'
+data = pd.read_excel(file_path)
+
+# Define input and output features
+columns_to_use = ['Pressure', 'Cathode humidity', 'anode humidity', 'cathode temperature',
+                  'anode temperature', 'cathode stoi', 'anode stoi', 'voltage']
+target_cols = ['power density', 'stand devision o2', 'System efficiency']
+
+X = data[columns_to_use]
+y = data[target_cols]
+
+# Data scaling
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+X_scaled = scaler_X.fit_transform(X)
+y_scaled = scaler_y.fit_transform(y)
+
+# Split the data
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_scaled, test_size=0.2, random_state=SEED)
+
+# Define objective functions for each model
+def objective_rf(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 4),
+        'random_state': SEED
+    }
+    model = MultiOutputRegressor(RandomForestRegressor(**params))
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_pred_inverse = scaler_y.inverse_transform(y_pred)
+    y_test_inverse = scaler_y.inverse_transform(y_test)
+    r2 = r2_score(y_test_inverse, y_pred_inverse, multioutput='raw_values')
+    return np.mean(r2)
+
+def objective_gb(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators',300, 700),
+        'learning_rate': trial.suggest_loguniform('learning_rate', 0.01, 0.1),
+        'max_depth': trial.suggest_int('max_depth', 3, 7),
+        'random_state': SEED
+    }
+    model = MultiOutputRegressor(GradientBoostingRegressor(**params))
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_pred_inverse = scaler_y.inverse_transform(y_pred)
+    y_test_inverse = scaler_y.inverse_transform(y_test)
+    r2 = r2_score(y_test_inverse, y_pred_inverse, multioutput='raw_values')
+    return np.mean(r2)
+
+def objective_svr(trial):
+    params = {
+        'C': trial.suggest_loguniform('C', 0.1, 10),
+        'epsilon': trial.suggest_loguniform('epsilon', 0.01, 0.2),
+        'kernel': trial.suggest_categorical('kernel', ['linear', 'rbf'])
+    }
+    model = MultiOutputRegressor(SVR(**params))
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_pred_inverse = scaler_y.inverse_transform(y_pred)
+    y_test_inverse = scaler_y.inverse_transform(y_test)
+    r2 = r2_score(y_test_inverse, y_pred_inverse, multioutput='raw_values')
+    return np.mean(r2)
+
+def objective_ann(trial):
+    params = {
+        'hidden_layer_sizes': trial.suggest_categorical("hidden_layer_sizes", [(50,), (100,), (50, 50)]),
+        'activation': trial.suggest_categorical("activation", ['relu', 'tanh']),
+        'learning_rate_init': trial.suggest_loguniform("learning_rate_init", 1e-3, 1e-1),
+        'alpha': trial.suggest_loguniform("alpha", 1e-4, 1e-1),
+        'batch_size': trial.suggest_categorical("batch_size", [32, 64]),
+        'random_state': SEED
+    }
+    model = MultiOutputRegressor(MLPRegressor(max_iter=1000, early_stopping=True, **params))
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_pred_inverse = scaler_y.inverse_transform(y_pred)
+    y_test_inverse = scaler_y.inverse_transform(y_test)
+    r2 = r2_score(y_test_inverse, y_pred_inverse, multioutput='raw_values')
+    return np.mean(r2)
+
+def objective_xgb(trial):
+    params = {
+        "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+        "learning_rate": trial.suggest_loguniform("learning_rate", 0.01, 0.2),
+        "max_depth": trial.suggest_int("max_depth", 3, 7),
+        "subsample": trial.suggest_uniform("subsample", 0.6, 0.9),
+        "colsample_bytree": trial.suggest_uniform("colsample_bytree", 0.6, 1.0),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+        "random_state": SEED
+    }
+    model = xgb.XGBRegressor(**params)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_pred_inverse = scaler_y.inverse_transform(y_pred)
+    y_test_inverse = scaler_y.inverse_transform(y_test)
+    r2 = r2_score(y_test_inverse, y_pred_inverse, multioutput='raw_values')
+    return np.mean(r2)
+
+# Optimize and train models
+models = {
+    "Random Forest": (objective_rf, RandomForestRegressor),
+    "Gradient Boosting": (objective_gb, GradientBoostingRegressor),
+    "Support Vector Machine": (objective_svr, SVR),
+    "Artificial Neural Network": (objective_ann, MLPRegressor),
+    "XGBoost": (objective_xgb, xgb.XGBRegressor)
+}
+
+best_models = {}
+all_results = []
+results = {}
+
+for name, (objective, model_class) in models.items():
+    print(f"\nTuning {name}...")
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=SEED))
+    study.optimize(objective, n_trials=20)
+    best_params = study.best_params
+    print(f"Best hyperparameters for {name}: {best_params}")
+
+    if name == "XGBoost":
+        final_model = model_class(**best_params, random_state=SEED)
+    elif name == "Artificial Neural Network":
+        final_model = MultiOutputRegressor(model_class(random_state=SEED, max_iter=1000, early_stopping=True, **best_params))
+    elif name == "Gradient Boosting": # Changed here to only include "Gradient Boosting"
+        final_model = MultiOutputRegressor(model_class(**best_params, random_state=SEED))
+    elif name == "Support Vector Machine": # Added a separate condition for SVR
+        final_model = MultiOutputRegressor(model_class(**best_params))  # Remove random_state=SEED for SVR
+    else:
+        final_model = MultiOutputRegressor(model_class(**best_params, random_state=SEED))
+    final_model.fit(X_train, y_train)
+    best_models[name] = final_model
+
+    y_pred = final_model.predict(X_test)
+    y_pred_inverse = scaler_y.inverse_transform(y_pred)
+    y_test_inverse = scaler_y.inverse_transform(y_test)
+
+    rmse = np.sqrt(mean_squared_error(y_test_inverse, y_pred_inverse, multioutput='raw_values'))
+    r2 = r2_score(y_test_inverse, y_pred_inverse, multioutput='raw_values')
+
+    results[name] = {'RMSE': rmse, 'R2': r2}
+
+    print(f"\nResults for {name}:")
+    print(f"RMSE: {rmse}")
+    print(f"R2: {r2}")
+
+    all_results = []
+    all_results.append([name, *rmse, *r2])
+
+    headers = ["Model", "RMSE (Power Density)", "RMSE (O2 Uniformity)", "RMSE (Efficiency)",
+               "R2 (Power Density)", "R2 (O2 Uniformity)", "R2 (Efficiency)"]
+    print("\n========== KẾT QUẢ CUỐI CÙNG ==========")
+    print(tabulate(all_results, headers=headers, tablefmt="grid"))
+
+# Generate and plot I-V curves
+operating_points = [
+    {'Pressure': 1, 'Cathode humidity': 100, 'anode humidity': 100, 'cathode temperature': 80,
+     'anode temperature': 80, 'cathode stoi': 1.4, 'anode stoi': 1.4, 'voltage': 0},
+]
+
+def generate_iv_curve_fixed_params(model, operating_point, label=None):
+    voltages = data['voltage'].unique()
+    i_v_curve = []
+    for v in voltages:
+        operating_point['voltage'] = v
+        input_df = pd.DataFrame([operating_point], columns=columns_to_use)
+        input_scaled = scaler_X.transform(input_df)
+        pred = model.predict(input_scaled)
+        power_density = scaler_y.inverse_transform(pred)[0, 0]
+        current_density = power_density / v if v != 0 else 0
+        i_v_curve.append([current_density, v])
+    return np.array(i_v_curve)
+
+plt.figure(figsize=(10, 6))
+
+experimental_voltage_1 = np.array([0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35])
+experimental_current_density_1 = np.array([0.0, 0.016061, 0.063914, 0.176526, 0.348701, 0.553082, 0.765641,
+                                          0.967517, 1.141328, 1.273702, 1.364823, 1.425272, 1.464438])
+
+plt.plot(experimental_current_density_1, experimental_voltage_1, 'k--', label='Data BASE ')
+
+for name, model in best_models.items():
+    iv_curve_1 = generate_iv_curve_fixed_params(model, operating_points[0].copy(), label=name)
+    plt.plot(iv_curve_1[:, 0], iv_curve_1[:, 1], marker='o', linestyle='-', label=f'{name} ')
+
+best_model_name = max(results, key=lambda k: np.mean(results[k]['R2']))
+best_model = best_models[best_model_name]
+
+print(f"The best model is: {best_model_name}")
+print(f"RMSE: {results[best_model_name]['RMSE']}")
+print(f"R2: {results[best_model_name]['R2']}")
+
+joblib.dump(best_model, 'best_model.pkl')
+
+for model_name, model in best_models.items():
+    joblib.dump(model, f'{model_name}.pkl')
+
+print("Models saved successfully!")
+
+plt.xlabel('Current Density (A/cm²)')
+plt.ylabel('Voltage (V)')
+plt.title('I-V Curve Comparison')
+plt.legend(fontsize='small')
+plt.grid()
+plt.show()
+
+
+
+!pip install pymoo joblib numpy pandas scikit-learn matplotlib
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import joblib
+from pymoo.algorithms.moo.nsga3 import NSGA3
+from pymoo.optimize import minimize
+from pymoo.core.problem import Problem
+from pymoo.util.ref_dirs import get_reference_directions
+from pymoo.operators.sampling.rnd import FloatRandomSampling
+import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score
+
+# === 1️⃣ Load Dữ Liệu ===
+file_path = '/content/dataset_formodel33.xlsx'
+data = pd.read_excel(file_path)
+
+# Các biến đầu vào & đầu ra
+columns_to_use = ['Pressure', 'Cathode humidity', 'anode humidity', 'cathode temperature',
+                  'anode temperature', 'cathode stoi', 'anode stoi', 'voltage']
+target_cols = ['power density', 'stand devision o2', 'System efficiency']
+
+# Load model tốt nhất
+best_model = joblib.load('Artificial Neural Network.pkl')
+
+# Chuẩn hóa dữ liệu
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+X_scaled = scaler_X.fit_transform(data[columns_to_use])
+scaler_y.fit(data[target_cols])  # Cần fit scaler_y để inverse_transform sau này
+
+# === 2️⃣ Định Nghĩa Bài Toán Tối Ưu ===
+class PEMFC_Optimization(Problem):
+    def __init__(self, model):
+        super().__init__(n_var=len(columns_to_use),
+                         n_obj=3,
+                         n_constr=0,
+                         xl=np.array([data[col].min() for col in columns_to_use]),
+                         xu=np.array([data[col].max() for col in columns_to_use]))
+        self.model = model
+
+    def _evaluate(self, X, out, *args, **kwargs):
+        if X.shape[1] != len(columns_to_use):
+            raise ValueError(f"❌ Sai kích thước đầu vào! Expected {len(columns_to_use)}, got {X.shape[1]}")
+
+        X_scaled = scaler_X.transform(X)
+        predictions_scaled = self.model.predict(X_scaled)
+        predictions = scaler_y.inverse_transform(predictions_scaled)
+
+        # Chuyển đổi dấu để phù hợp với tối ưu hóa
+        out["F"] = np.column_stack([
+            -predictions[:, 0],  # Maximize Power Density
+            predictions[:, 1],  # Minimize O2 Uniformity
+            -predictions[:, 2]   # Maximize Efficiency
+        ])
+
+# === 3️⃣ Chạy NSGA-III ===
+def run_nsga3_optimization(model):
+    problem = PEMFC_Optimization(model)
+    ref_dirs = get_reference_directions("das-dennis", 3, n_partitions=12)
+    algorithm = NSGA3(pop_size=92, sampling=FloatRandomSampling(), ref_dirs=ref_dirs)
+
+    res = minimize(problem, algorithm, ('n_gen', 200), seed=1, verbose=True)
+    return res.X, -res.F
+
+optimized_parameters, optimized_objectives = run_nsga3_optimization(best_model)
+
+print("\n🔹 **Optimized Parameters:**")
+print(optimized_parameters)
+print("\n🔹 **Optimized Objectives (Power Density, O2 Uniformity, Efficiency):**")
+print(optimized_objectives)
+
+# === 4️⃣ Vẽ Biểu Đồ ===
+X_test = data[columns_to_use]
+X_test_scaled = scaler_X.transform(X_test)
+y_test = data[target_cols]
+y_pred_best = scaler_y.inverse_transform(best_model.predict(X_test_scaled))
+best_r2 = r2_score(y_test, y_pred_best, multioutput='raw_values')
+
+fig, axes = plt.subplots(3, 1, figsize=(6, 15))
+labels = ["Power Density", "System Efficiency", "Oxygen Distribution Uniformity"]
+
+for i, ax in enumerate(axes):
+    sorted_idx = np.argsort(y_test.iloc[:, i])
+    ax.scatter(y_test.iloc[:, i], y_pred_best[:, i], color='red', label='Data points')
+    ax.plot(y_test.iloc[sorted_idx, i], y_test.iloc[sorted_idx, i], color='blue', label='Fit line')
+    ax.set_xlabel(f"Simulated {labels[i]}")
+    ax.set_ylabel(f"Predicted {labels[i]}")
+    ax.set_title(labels[i])
+    ax.legend()
+    ax.text(0.05, 0.9, f"$R^2={best_r2[i]:.4f}$", transform=ax.transAxes, fontsize=12)
+
+plt.tight_layout()
+plt.show()
